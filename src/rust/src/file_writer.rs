@@ -5,8 +5,7 @@ use crate::packed_r_tree::{calc_extent, hilbert_sort, NodeItem, PackedRTree};
 use crate::{Column, ColumnArgs, Header, HeaderArgs, MAGIC_BYTES};
 use flatbuffers::FlatBufferBuilder;
 use geozero::CoordDimensions;
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, Write};
+use std::io::Write;
 
 /// FlatGeobuf dataset writer
 ///
@@ -30,7 +29,7 @@ use std::io::{BufReader, BufWriter, Read, Seek, Write};
 /// # }
 /// ```
 pub struct FgbWriter<'a> {
-    tmpout: BufWriter<File>,
+    feat_data: Vec<u8>,
     fbb: FlatBufferBuilder<'a>,
     header_args: HeaderArgs<'a>,
     columns: Vec<flatbuffers::WIPOffset<Column<'a>>>,
@@ -100,7 +99,7 @@ pub struct FgbCrs<'a> {
     pub code_string: Option<&'a str>,
 }
 
-// Offsets in temporary file
+// Offsets in feature data buffer
 struct FeatureOffset {
     offset: usize,
     size: usize,
@@ -193,10 +192,8 @@ impl<'a> FgbWriter<'a> {
             dims,
         );
 
-        let tmpout = BufWriter::new(tempfile::tempfile()?);
-
         Ok(FgbWriter {
-            tmpout,
+            feat_data: Vec::new(),
             fbb,
             header_args,
             columns: Vec::new(),
@@ -237,16 +234,12 @@ impl<'a> FgbWriter<'a> {
         node.offset = self.feat_offsets.len() as u64;
         self.feat_nodes.push(node);
         let feat_buf = self.feat_writer.finish_to_feature();
-        let tmpoffset = self
-            .feat_offsets
-            .last()
-            .map(|it| it.offset + it.size)
-            .unwrap_or(0);
+        let offset = self.feat_data.len();
         self.feat_offsets.push(FeatureOffset {
-            offset: tmpoffset,
+            offset,
             size: feat_buf.len(),
         });
-        self.tmpout.write_all(&feat_buf)?;
+        self.feat_data.extend_from_slice(&feat_buf);
         self.header_args.features_count += 1;
         Ok(())
     }
@@ -290,18 +283,10 @@ impl<'a> FgbWriter<'a> {
             tree.stream_write(&mut out)?;
         }
 
-        // Copy features from temp file in sort order.
-        // Read the entire temp file into memory so that writing in Hilbert order
-        // becomes simple slice copies instead of millions of random seeks.
-        self.tmpout.rewind()?;
-        let unsorted_feature_output = self.tmpout.into_inner().map_err(|e| e.into_error())?;
-        let mut unsorted_feature_reader = BufReader::new(unsorted_feature_output);
-        let mut all_data = Vec::new();
-        unsorted_feature_reader.read_to_end(&mut all_data)?;
-
+        // Write features in Hilbert sort order from in-memory buffer
         for node in &self.feat_nodes {
             let feat = &self.feat_offsets[node.offset as usize];
-            out.write_all(&all_data[feat.offset..feat.offset + feat.size])?;
+            out.write_all(&self.feat_data[feat.offset..feat.offset + feat.size])?;
         }
 
         Ok(())
