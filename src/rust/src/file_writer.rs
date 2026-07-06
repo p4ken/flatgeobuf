@@ -7,10 +7,17 @@ use crate::{Column, ColumnArgs, Header, HeaderArgs, MAGIC_BYTES};
 use byteorder::{ByteOrder, LittleEndian};
 use flatbuffers::FlatBufferBuilder;
 use geozero::CoordDimensions;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
 /// FlatGeobuf dataset writer
+///
+/// When used as a geozero processor (see example below), properties are
+/// matched to columns by name. A property with an undeclared name adds a
+/// new column declaration, typed after its first value. A value whose
+/// encoding is incompatible with the declared column type is skipped with
+/// a warning.
 ///
 /// # Usage example:
 ///
@@ -41,6 +48,9 @@ pub struct FgbWriter<'a> {
     // Current position of each column, indexed by original insertion index.
     // Feature buffers always store original indices; they are remapped on `write`.
     col_remap: Vec<u16>,
+    // Original insertion index of each column, by name. Unaffected by
+    // `sort_columns_by` because features are encoded with original indices.
+    col_index: HashMap<String, u16>,
     feat_writer: FeatureWriter<'a>,
     feat_offsets: Vec<FeatureOffset>,
     feat_nodes: Vec<NodeItem>,
@@ -209,6 +219,7 @@ impl<'a> FgbWriter<'a> {
             columns: Vec::new(),
             col_meta: Vec::new(),
             col_remap: Vec::new(),
+            col_index: HashMap::new(),
             feat_writer,
             feat_offsets: Vec::new(),
             feat_nodes: Vec::new(),
@@ -236,6 +247,8 @@ impl<'a> FgbWriter<'a> {
             ..Default::default()
         };
         cfgfn(&mut self.fbb, &mut col);
+        self.col_index
+            .insert(name.to_string(), self.col_remap.len() as u16);
         self.col_remap.push(self.columns.len() as u16);
         self.col_meta.push((name.to_string(), col.type_));
         self.columns.push(Column::create(&mut self.fbb, &col));
@@ -423,6 +436,7 @@ fn remap_property_columns(
 
 mod geozero_api {
     use crate::feature_writer::{prop_type, FeatureWriter};
+    use crate::header_generated::ColumnType;
     use crate::FgbWriter;
     use geozero::error::GeozeroError;
     use geozero::{
@@ -432,6 +446,8 @@ mod geozero_api {
 
     impl FgbWriter<'_> {
         /// Add a new feature.
+        ///
+        /// Property indices must correspond to the column declaration order.
         ///
         /// # Usage example:
         ///
@@ -484,21 +500,50 @@ mod geozero_api {
     }
 
     impl PropertyProcessor for FgbWriter<'_> {
-        fn property(&mut self, i: usize, colname: &str, colval: &ColumnValue) -> Result<bool> {
-            if i >= self.columns.len() {
-                if i == self.columns.len() {
-                    info!(
-                    "Undefined property index {i}, column: `{colname}` - adding column declaration"
-                );
-                    self.add_column(colname, prop_type(colval), |_, _| {});
-                } else {
-                    info!("Undefined property index {i}, column: `{colname}` - skipping");
-                    return Ok(false);
+        fn property(&mut self, _i: usize, colname: &str, colval: &ColumnValue) -> Result<bool> {
+            // The geozero contract does not guarantee property indices to be
+            // consistent across features, so columns are matched by name.
+            let original = match self.col_index.get(colname) {
+                Some(&original) => {
+                    let current = self.col_remap[original as usize] as usize;
+                    let declared = self.col_meta[current].1;
+                    let actual = prop_type(colval);
+                    if !same_encoded_width(declared, actual) {
+                        warn!(
+                            "Value of type {actual:?} does not fit in column `{colname}` of type {declared:?} - skipping"
+                        );
+                        return Ok(false);
+                    }
+                    original
                 }
-            }
-            // TODO: check name and type against existing declaration
-            self.feat_writer.property(i, colname, colval)
+                None => {
+                    debug!("Adding declaration for undeclared column `{colname}`");
+                    self.add_column(colname, prop_type(colval), |_, _| {});
+                    (self.col_remap.len() - 1) as u16
+                }
+            };
+            self.feat_writer.property(original as usize, colname, colval)
         }
+    }
+
+    /// Whether two column types share the same property value encoding, so
+    /// that a value encoded as one type can be read back as the other.
+    fn same_encoded_width(a: ColumnType, b: ColumnType) -> bool {
+        fn width(col_type: ColumnType) -> Option<u8> {
+            match col_type {
+                ColumnType::Bool | ColumnType::Byte | ColumnType::UByte => Some(1),
+                ColumnType::Short | ColumnType::UShort => Some(2),
+                ColumnType::Int | ColumnType::UInt | ColumnType::Float => Some(4),
+                ColumnType::Long | ColumnType::ULong | ColumnType::Double => Some(8),
+                // Length-prefixed encoding
+                ColumnType::String
+                | ColumnType::Json
+                | ColumnType::DateTime
+                | ColumnType::Binary => Some(0),
+                _ => None,
+            }
+        }
+        matches!((width(a), width(b)), (Some(a), Some(b)) if a == b)
     }
 
     // Delegate GeomProcessor to self.feat_writer

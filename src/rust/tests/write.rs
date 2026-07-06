@@ -198,6 +198,95 @@ fn sort_columns() -> Result<()> {
 }
 
 #[test]
+fn property_matched_by_name() -> Result<()> {
+    let mut fgb = FgbWriter::create_with_options(
+        "hetero",
+        GeometryType::Point,
+        FgbWriterOptions {
+            write_index: false,
+            ..Default::default()
+        },
+    )?;
+
+    // Schema-less input: the second feature has a subset of properties, so
+    // `name` arrives with property index 0 instead of 1.
+    let mut fc = GeoJson(
+        r#"{"type": "FeatureCollection", "features": [
+            {"type": "Feature", "properties": {"fid": 42, "name": "New Zealand"}, "geometry": {"type": "Point", "coordinates": [1, 1]}},
+            {"type": "Feature", "properties": {"name": "South Africa"}, "geometry": {"type": "Point", "coordinates": [2, 2]}}
+        ]}"#,
+    );
+    fc.process(&mut fgb)?;
+
+    // Auto-declared columns are remapped like explicitly declared ones
+    fgb.sort_columns_by(|a, b| b.cmp(a));
+
+    let mut output = vec![];
+    fgb.write(&mut output).expect("writable");
+
+    let mut reader = FgbReader::open(&*output)
+        .expect("openable")
+        .select_all_seq()
+        .expect("select all");
+    let columns = reader.header().columns().expect("columns exist");
+    let names: Vec<&str> = columns.iter().map(|c| c.name()).collect();
+    assert_eq!(names, ["name", "fid"]);
+
+    let feature = FallibleStreamingIterator::next(&mut reader)
+        .expect("successful read")
+        .expect("feature exists");
+    let props = feature.properties().expect("valid properties");
+    assert_eq!(props["fid"], "42");
+    assert_eq!(props["name"], "New Zealand");
+
+    let feature = FallibleStreamingIterator::next(&mut reader)
+        .expect("successful read")
+        .expect("feature exists");
+    let props = feature.properties().expect("valid properties");
+    assert_eq!(props.get("fid"), None);
+    assert_eq!(props["name"], "South Africa");
+
+    Ok(())
+}
+
+#[test]
+fn property_incompatible_type_skipped() -> Result<()> {
+    let mut fgb = FgbWriter::create_with_options(
+        "typed",
+        GeometryType::Point,
+        FgbWriterOptions {
+            write_index: false,
+            ..Default::default()
+        },
+    )?;
+    fgb.add_column("fid", ColumnType::Int, |_, _| {});
+
+    // A string value cannot be stored in an Int column
+    let mut fc = GeoJson(
+        r#"{"type": "FeatureCollection", "features": [
+            {"type": "Feature", "properties": {"fid": "abc", "name": "New Zealand"}, "geometry": {"type": "Point", "coordinates": [1, 1]}}
+        ]}"#,
+    );
+    fc.process(&mut fgb)?;
+
+    let mut output = vec![];
+    fgb.write(&mut output).expect("writable");
+
+    let mut reader = FgbReader::open(&*output)
+        .expect("openable")
+        .select_all_seq()
+        .expect("select all");
+    let feature = FallibleStreamingIterator::next(&mut reader)
+        .expect("successful read")
+        .expect("feature exists");
+    let props = feature.properties().expect("valid properties");
+    assert_eq!(props.get("fid"), None);
+    assert_eq!(props["name"], "New Zealand");
+
+    Ok(())
+}
+
+#[test]
 fn column_size() -> Result<()> {
     let mut fgb = FgbWriter::create_with_options(
         "countries",
