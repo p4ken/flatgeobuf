@@ -1,8 +1,10 @@
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::feature_generated::size_prefixed_root_as_feature;
 use crate::feature_writer::FeatureWriter;
 use crate::header_generated::{ColumnType, Crs, CrsArgs, GeometryType};
 use crate::packed_r_tree::{calc_extent, hilbert_sort, NodeItem, PackedRTree};
 use crate::{Column, ColumnArgs, Header, HeaderArgs, MAGIC_BYTES};
+use byteorder::{ByteOrder, LittleEndian};
 use flatbuffers::FlatBufferBuilder;
 use geozero::CoordDimensions;
 use std::fs::File;
@@ -34,6 +36,11 @@ pub struct FgbWriter<'a> {
     fbb: FlatBufferBuilder<'a>,
     header_args: HeaderArgs<'a>,
     columns: Vec<flatbuffers::WIPOffset<Column<'a>>>,
+    // Name and type of each column, in the same (current) order as `columns`
+    col_meta: Vec<(String, ColumnType)>,
+    // Current position of each column, indexed by original insertion index.
+    // Feature buffers always store original indices; they are remapped on `write`.
+    col_remap: Vec<u16>,
     feat_writer: FeatureWriter<'a>,
     feat_offsets: Vec<FeatureOffset>,
     feat_nodes: Vec<NodeItem>,
@@ -200,6 +207,8 @@ impl<'a> FgbWriter<'a> {
             fbb,
             header_args,
             columns: Vec::new(),
+            col_meta: Vec::new(),
+            col_remap: Vec::new(),
             feat_writer,
             feat_offsets: Vec::new(),
             feat_nodes: Vec::new(),
@@ -227,7 +236,43 @@ impl<'a> FgbWriter<'a> {
             ..Default::default()
         };
         cfgfn(&mut self.fbb, &mut col);
+        self.col_remap.push(self.columns.len() as u16);
+        self.col_meta.push((name.to_string(), col.type_));
         self.columns.push(Column::create(&mut self.fbb, &col));
+    }
+
+    /// Reorder columns with a stable sort using the given comparator on column names.
+    ///
+    /// The column order of the header and the column indices stored in all
+    /// features (including features already added) are updated accordingly
+    /// when [`write`](Self::write) is called, without re-encoding features.
+    ///
+    /// # Usage example:
+    ///
+    /// ```
+    /// # use flatgeobuf::*;
+    /// # let mut fgb = FgbWriter::create("", GeometryType::Point).unwrap();
+    /// fgb.add_column("name", ColumnType::String, |_, _| {});
+    /// fgb.add_column("fid", ColumnType::ULong, |_, _| {});
+    /// fgb.sort_columns_by(|a, b| a.cmp(b));
+    /// ```
+    pub fn sort_columns_by<F>(&mut self, mut cmp: F)
+    where
+        F: FnMut(&str, &str) -> std::cmp::Ordering,
+    {
+        let mut indices: Vec<usize> = (0..self.col_meta.len()).collect();
+        indices.sort_by(|&a, &b| cmp(&self.col_meta[a].0, &self.col_meta[b].0));
+
+        // Positions of columns change from `cur` to `new`
+        let mut pos_map = vec![0u16; indices.len()];
+        for (new, &cur) in indices.iter().enumerate() {
+            pos_map[cur] = new as u16;
+        }
+        for cur in &mut self.col_remap {
+            *cur = pos_map[*cur as usize];
+        }
+        self.columns = indices.iter().map(|&i| self.columns[i]).collect();
+        self.col_meta = indices.iter().map(|&i| self.col_meta[i].clone()).collect();
     }
 
     fn write_feature(&mut self) -> Result<()> {
@@ -295,6 +340,18 @@ impl<'a> FgbWriter<'a> {
         let unsorted_feature_output = self.tmpout.into_inner().map_err(|e| e.into_error())?;
         let mut unsorted_feature_reader = BufReader::new(unsorted_feature_output);
 
+        // Column positions may have been changed by `sort_columns_by`
+        let remap_needed = self
+            .col_remap
+            .iter()
+            .enumerate()
+            .any(|(original, &cur)| original != cur as usize);
+        let types_by_original: Vec<ColumnType> = self
+            .col_remap
+            .iter()
+            .map(|&cur| self.col_meta[cur as usize].1)
+            .collect();
+
         // Clippy generates a false-positive here, needs a block to disable, see
         // https://github.com/rust-lang/rust-clippy/issues/9274
         #[allow(clippy::read_zero_byte_vec)]
@@ -305,12 +362,63 @@ impl<'a> FgbWriter<'a> {
                 unsorted_feature_reader.seek(SeekFrom::Start(feat.offset as u64))?;
                 buf.resize(feat.size, 0);
                 unsorted_feature_reader.read_exact(&mut buf)?;
+                if remap_needed {
+                    remap_property_columns(&mut buf, &self.col_remap, &types_by_original)?;
+                }
                 out.write_all(&buf)?;
             }
         }
 
         Ok(())
     }
+}
+
+/// Rewrite the column indices embedded in the properties of an encoded feature.
+///
+/// `remap` maps original column indices to their current positions and
+/// `types_by_original` gives the column type for each original index,
+/// which determines the encoded size of each property value.
+fn remap_property_columns(
+    feature_buf: &mut [u8],
+    remap: &[u16],
+    types_by_original: &[ColumnType],
+) -> Result<()> {
+    let feature = size_prefixed_root_as_feature(feature_buf)?;
+    let Some(props) = feature.properties() else {
+        return Ok(());
+    };
+    let start = props.bytes().as_ptr() as usize - feature_buf.as_ptr() as usize;
+    let len = props.len();
+    let props = &mut feature_buf[start..start + len];
+
+    let mut pos = 0;
+    while pos + size_of::<u16>() <= props.len() {
+        let original = LittleEndian::read_u16(&props[pos..]) as usize;
+        let (Some(&cur), Some(&col_type)) = (remap.get(original), types_by_original.get(original))
+        else {
+            return Err(Error::IllegalColumnIndex(original));
+        };
+        LittleEndian::write_u16(&mut props[pos..], cur);
+        pos += size_of::<u16>();
+        let value_size = match col_type {
+            ColumnType::Bool | ColumnType::Byte | ColumnType::UByte => 1,
+            ColumnType::Short | ColumnType::UShort => 2,
+            ColumnType::Int | ColumnType::UInt | ColumnType::Float => 4,
+            ColumnType::Long | ColumnType::ULong | ColumnType::Double => 8,
+            ColumnType::String
+            | ColumnType::Json
+            | ColumnType::DateTime
+            | ColumnType::Binary => {
+                if pos + size_of::<u32>() > props.len() {
+                    return Err(Error::IllegalColumnIndex(original));
+                }
+                size_of::<u32>() + LittleEndian::read_u32(&props[pos..]) as usize
+            }
+            _ => return Err(Error::IllegalColumnIndex(original)),
+        };
+        pos += value_size;
+    }
+    Ok(())
 }
 
 mod geozero_api {

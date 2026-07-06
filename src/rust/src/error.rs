@@ -8,6 +8,7 @@ pub enum Error {
     #[cfg(feature = "http")]
     HttpClient(http_range_client::HttpError),
     IllegalHeaderSize(usize),
+    IllegalColumnIndex(usize),
     InvalidFlatbuffer(InvalidFlatbuffer),
     IO(std::io::Error),
     UnsupportedGeometryType(String),
@@ -22,6 +23,7 @@ impl Display for Error {
             #[cfg(feature = "http")]
             Error::HttpClient(http_client) => http_client.fmt(f),
             Error::IllegalHeaderSize(size) => write!(f, "Illegal header size: {size}"),
+            Error::IllegalColumnIndex(index) => write!(f, "Illegal column index: {index}"),
             Error::InvalidFlatbuffer(invalid_flatbuffer) => invalid_flatbuffer.fmt(f),
             Error::IO(io) => io.fmt(f),
             Error::UnsupportedGeometryType(s) => f.write_str(s),

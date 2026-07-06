@@ -134,6 +134,70 @@ fn json_to_fgb() -> Result<()> {
 }
 
 #[test]
+fn sort_columns() -> Result<()> {
+    let mut fgb = FgbWriter::create_with_options(
+        "sortable",
+        GeometryType::Point,
+        FgbWriterOptions {
+            write_index: false,
+            ..Default::default()
+        },
+    )?;
+    fgb.add_column("name", ColumnType::String, |_fbb, _col| {});
+    fgb.add_column("fid", ColumnType::Long, |_fbb, _col| {});
+    fgb.add_column("flag", ColumnType::Bool, |_fbb, _col| {});
+
+    let geom = GeoJson(r#"{"type": "Point", "coordinates": [1.0, 1.0]}"#);
+    fgb.add_feature_geom(geom, |feat| {
+        feat.property(0, "name", &ColumnValue::String("New Zealand"))
+            .unwrap();
+        feat.property(1, "fid", &ColumnValue::Long(42)).unwrap();
+        feat.property(2, "flag", &ColumnValue::Bool(true)).unwrap();
+    })?;
+    let geom = GeoJson(r#"{"type": "Point", "coordinates": [2.0, 2.0]}"#);
+    fgb.add_feature_geom(geom, |feat| {
+        // Subset of columns, in a different order
+        feat.property(2, "flag", &ColumnValue::Bool(false)).unwrap();
+        feat.property(0, "name", &ColumnValue::String("South Africa"))
+            .unwrap();
+    })?;
+
+    fgb.sort_columns_by(|a, b| a.cmp(b));
+
+    let mut output = vec![];
+    fgb.write(&mut output).expect("writable");
+
+    let mut reader = FgbReader::open(&*output)
+        .expect("openable")
+        .select_all_seq()
+        .expect("select all");
+    let columns = reader.header().columns().expect("columns exist");
+    let names: Vec<&str> = columns.iter().map(|c| c.name()).collect();
+    assert_eq!(names, ["fid", "flag", "name"]);
+    assert_eq!(columns.get(0).type_(), ColumnType::Long);
+    assert_eq!(columns.get(1).type_(), ColumnType::Bool);
+    assert_eq!(columns.get(2).type_(), ColumnType::String);
+
+    let feature = FallibleStreamingIterator::next(&mut reader)
+        .expect("successful read")
+        .expect("feature exists");
+    let props = feature.properties().expect("valid properties");
+    assert_eq!(props["fid"], "42");
+    assert_eq!(props["flag"], "true");
+    assert_eq!(props["name"], "New Zealand");
+
+    let feature = FallibleStreamingIterator::next(&mut reader)
+        .expect("successful read")
+        .expect("feature exists");
+    let props = feature.properties().expect("valid properties");
+    assert_eq!(props.get("fid"), None);
+    assert_eq!(props["flag"], "false");
+    assert_eq!(props["name"], "South Africa");
+
+    Ok(())
+}
+
+#[test]
 fn column_size() -> Result<()> {
     let mut fgb = FgbWriter::create_with_options(
         "countries",
