@@ -328,25 +328,37 @@ impl<'a> FgbWriter<'a> {
         let buf = self.fbb.finished_data();
         out.write_all(buf)?;
 
+        // Offsets into the temp file, in output order
+        let sorted_offsets: Vec<FeatureOffset>;
         if self.header_args.index_node_size > 0 && !self.feat_nodes.is_empty() {
             // Create sorted index
             hilbert_sort(&mut self.feat_nodes, &extent);
-            // Update offsets for index
+            // Update node offsets in place for the index, collecting the temp
+            // file locations in sort order for the feature copy below
             let mut offset = 0;
-            let index_nodes = self
+            sorted_offsets = self
                 .feat_nodes
-                .iter()
-                .map(|tmpnode| {
-                    let feat = &self.feat_offsets[tmpnode.offset as usize];
-                    let mut node = tmpnode.clone();
+                .iter_mut()
+                .map(|node| {
+                    let feat = &self.feat_offsets[node.offset as usize];
                     node.offset = offset;
                     offset += feat.size as u64;
-                    node
+                    FeatureOffset {
+                        offset: feat.offset,
+                        size: feat.size,
+                    }
                 })
-                .collect::<Vec<_>>();
-            let tree = PackedRTree::build(&index_nodes, &extent, self.header_args.index_node_size)?;
-            tree.stream_write(&mut out)?;
+                .collect();
+            self.feat_offsets = Vec::new();
+            PackedRTree::stream_write_from_leaves(
+                &self.feat_nodes,
+                self.header_args.index_node_size,
+                &mut out,
+            )?;
+        } else {
+            sorted_offsets = std::mem::take(&mut self.feat_offsets);
         }
+        self.feat_nodes = Vec::new();
 
         // Copy features from temp file in sort order
         self.tmpout.rewind()?;
@@ -370,8 +382,7 @@ impl<'a> FgbWriter<'a> {
         #[allow(clippy::read_zero_byte_vec)]
         {
             let mut buf = Vec::with_capacity(2048);
-            for node in &self.feat_nodes {
-                let feat = &self.feat_offsets[node.offset as usize];
+            for feat in &sorted_offsets {
                 unsorted_feature_reader.seek(SeekFrom::Start(feat.offset as u64))?;
                 buf.resize(feat.size, 0);
                 unsorted_feature_reader.read_exact(&mut buf)?;

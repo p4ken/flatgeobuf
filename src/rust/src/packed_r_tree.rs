@@ -422,6 +422,65 @@ impl PackedRTree {
         Ok(tree)
     }
 
+    /// Write a packed R-Tree index directly to `out` from leaf nodes, without
+    /// building an in-memory copy of the leaves.
+    ///
+    /// This produces the same bytes as [`build`](Self::build) followed by
+    /// [`stream_write`](Self::stream_write), but only allocates the internal
+    /// (non-leaf) nodes — roughly `1 / node_size` of the leaf count — which
+    /// matters for datasets with many features.
+    ///
+    /// - `leaf_nodes` must be sorted (see [`hilbert_sort`]) with `offset`
+    ///   values pointing into the feature data section.
+    /// - `node_size` is the branching factor; values are clamped to `[2, 65535]`.
+    pub fn stream_write_from_leaves<W: Write>(
+        leaf_nodes: &[NodeItem],
+        node_size: u16,
+        out: &mut W,
+    ) -> Result<()> {
+        let node_size = node_size.clamp(2, 65535);
+        let level_bounds = PackedRTree::generate_level_bounds(leaf_nodes.len(), node_size);
+        // Storage order is root..upper levels..leaves; leaves start at the
+        // end of the internal nodes, so global indices below `num_internal`
+        // address `internal` and the rest address `leaf_nodes`.
+        let num_internal = level_bounds
+            .first()
+            .expect("RTree has at least one level when node_size >= 2 and num_items > 0")
+            .start;
+        let mut internal = vec![NodeItem::create(0); num_internal];
+        for level in 0..level_bounds.len() - 1 {
+            let children_level = &level_bounds[level];
+            let parent_level = &level_bounds[level + 1];
+
+            let mut parent_idx = parent_level.start;
+            let mut child_idx = children_level.start;
+            while child_idx < children_level.end {
+                let mut parent_node = NodeItem::create(child_idx as u64);
+                for _j in 0..node_size {
+                    if child_idx >= children_level.end {
+                        break;
+                    }
+                    let child = if child_idx < num_internal {
+                        &internal[child_idx]
+                    } else {
+                        &leaf_nodes[child_idx - num_internal]
+                    };
+                    parent_node.expand(child);
+                    child_idx += 1;
+                }
+                internal[parent_idx] = parent_node;
+                parent_idx += 1;
+            }
+        }
+        for item in &internal {
+            item.write(out)?;
+        }
+        for item in leaf_nodes {
+            item.write(out)?;
+        }
+        Ok(())
+    }
+
     /// Read a packed R-Tree index from a byte stream into memory.
     ///
     /// The reader must be positioned at the start of the index bytes (i.e. right after the
@@ -1000,6 +1059,45 @@ mod tests {
         for i in 0..list2.len() {
             assert!(nodes[list2[i].index]
                 .intersects(&NodeItem::bounds(690407.0, 6063692.0, 811682.0, 6176467.0)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stream_write_from_leaves_matches_build() -> Result<()> {
+        use rand::distr::{Distribution, Uniform};
+
+        let unifx = Uniform::try_from(466379..708929)?;
+        let unify = Uniform::try_from(6096801..6322352)?;
+        let mut rng = rand::rng();
+
+        // Sizes around branching factor boundaries, including a single item
+        for n in [1usize, 2, 15, 16, 17, 256, 257, 10000] {
+            let mut nodes = Vec::with_capacity(n);
+            for _ in 0..n {
+                let x = unifx.sample(&mut rng) as f64;
+                let y = unify.sample(&mut rng) as f64;
+                nodes.push(NodeItem::bounds(x, y, x, y));
+            }
+            let extent = calc_extent(&nodes);
+            hilbert_sort(&mut nodes, &extent);
+            let mut offset = 0;
+            for node in &mut nodes {
+                node.offset = offset;
+                offset += 100;
+            }
+
+            let tree = PackedRTree::build(&nodes, &extent, PackedRTree::DEFAULT_NODE_SIZE)?;
+            let mut expected: Vec<u8> = Vec::new();
+            tree.stream_write(&mut expected)?;
+
+            let mut actual: Vec<u8> = Vec::new();
+            PackedRTree::stream_write_from_leaves(
+                &nodes,
+                PackedRTree::DEFAULT_NODE_SIZE,
+                &mut actual,
+            )?;
+            assert_eq!(actual, expected, "mismatch for {n} items");
         }
         Ok(())
     }
